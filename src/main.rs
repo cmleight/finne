@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
-mod http;
+mod http_1_1;
 
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
