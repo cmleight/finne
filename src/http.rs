@@ -6,11 +6,17 @@ pub struct HttpRequest<T> {
     body: T,
 }
 
+pub struct Header {
+}
+
 pub struct HttpResponse {
 }
 
-pub fn parse_request() -> HttpRequest {
-    todo!()
+
+impl<T> HttpRequest<T> {
+    pub fn parse_request() -> HttpRequest<T> {
+        todo!()
+    }
 }
 
 pub fn create_response() -> HttpResponse {
