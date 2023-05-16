@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+// use slab::Slab;
+use bytes::{BufMut, BytesMut};
+use httparse;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
-
-mod http_1_1;
+use object_pool::{Pool, Reusable};
 
 static RESPONSE: &str = "HTTP/1.1 200 OK
 Content-Type: text/html
@@ -13,14 +15,6 @@ Content-Length: 6
 
 hello
 ";
-
-fn is_double_crnl(window: &[u8]) -> bool {
-    window.len() >= 4
-        && (window[0] == b'\r')
-        && (window[1] == b'\n')
-        && (window[2] == b'\r')
-        && (window[3] == b'\n')
-}
 
 fn main() {
     let address = "0.0.0.0:3000";
@@ -33,65 +27,92 @@ fn main() {
 
     let mut counter: usize = 0;
     let mut sockets: HashMap<Token, TcpStream> = HashMap::new();
-    let mut requests: HashMap<Token, Vec<u8>> = HashMap::new();
     let mut buffer = [0_u8; 1024];
+    let buf_pool = Pool::new(300, &|| BytesMut::with_capacity(1024));
 
     let mut events = Events::with_capacity(1024);
-    loop {
-        poll.poll(&mut events, None).unwrap();
-        for event in &events {
-            match event.token() {
-                Token(0) => loop {
-                    match listener.accept() {
-                        Ok((mut socket, _)) => {
-                            counter += 1;
-                            let token = Token(counter);
-                            poll.registry().register(&mut socket, token, Interest::READABLE).unwrap();
+    {
+        // This is an incredibly dumb solution to both requests and buf_pool
+        // going out of scope at the same time.
+        // AKA the borrow checker getting in the way.
+        let mut requests: HashMap<Token, Reusable<BytesMut>> = HashMap::new();
+        loop {
+            poll.poll(&mut events, None).unwrap();
+            for event in &events {
+                match event.token() {
+                    Token(0) => loop {
+                        match listener.accept() {
+                            Ok((mut socket, _)) => {
+                                println!("Sockets: {:?}", sockets.len());
+                                counter += 1;
+                                let token = Token(counter);
+                                poll.registry()
+                                    .register(&mut socket, token, Interest::READABLE)
+                                    .unwrap();
 
-                            sockets.insert(token, socket);
-                            requests.insert(token, Vec::with_capacity(192));
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                },
-                token if event.is_readable() => {
-                    loop {
-                        let read = sockets.get_mut(&token).unwrap().read(&mut buffer);
-                        match read {
-                            Ok(0) => {
-                                sockets.remove(&token);
-                                break;
-                            }
-                            Ok(n) => {
-                                let req = requests.get_mut(&token).unwrap();
-                                for b in &buffer[0..n] {
-                                    req.push(*b);
-                                }
+                                sockets.insert(token, socket);
+                                let mut buf = buf_pool.pull(|| {
+                                    println!("Miss object pool allocation!");
+                                    BytesMut::with_capacity(1024)
+                                });
+                                buf.clear();
+                                requests.insert(token, buf);
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
                         }
+                    },
+                    token if event.is_readable() => {
+                        let mut headers = [httparse::Header {
+                            name: "",
+                            value: &[],
+                        }; 16];
+                        let mut request_parser = httparse::Request::new(&mut headers);
+                        loop {
+                            let read = sockets.get_mut(&token).unwrap().read(&mut buffer);
+                            match read {
+                                Ok(0) => {
+                                    sockets.remove(&token);
+                                    break;
+                                }
+                                Ok(n) => {
+                                    let req: &mut BytesMut = requests.get_mut(&token).unwrap();
+                                    if req.remaining_mut() < n {
+                                        req.reserve(n)
+                                    }
+                                    req.put_slice(&buffer[0..n])
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(_) => break,
+                            }
+                        }
+
+                        if requests.contains_key(&token) {
+                            let temp_req = requests.get(&token).unwrap();
+                            if request_parser.parse(temp_req).unwrap().is_complete() {
+                                poll.registry()
+                                    .reregister(
+                                        sockets.get_mut(&token).unwrap(),
+                                        token,
+                                        Interest::WRITABLE,
+                                    )
+                                    .unwrap();
+                            }
+                        }
                     }
+                    token if event.is_writable() => {
+                        requests.remove(&token).unwrap();
+                        println!("req len: {:?}", requests.len());
+                        let socket = sockets.get_mut(&token).unwrap();
+                        socket.write_all(RESPONSE.as_bytes()).unwrap();
 
-                    let ready = requests.get(&token).unwrap().windows(4).any(is_double_crnl);
-
-                    if ready {
-                        poll.registry().reregister(sockets.get_mut(&token).unwrap(), token, Interest::WRITABLE).unwrap();
+                        poll.registry()
+                            .reregister(socket, token, Interest::READABLE)
+                            .unwrap();
                     }
+                    _ => unreachable!(),
                 }
-                token if event.is_writable() => {
-                    requests.get_mut(&token).unwrap().clear();
-                    let socket = sockets.get_mut(&token).unwrap();
-                    socket
-                        .write_all(RESPONSE.as_bytes())
-                        .unwrap();
-
-                    poll.registry().reregister(socket, token, Interest::READABLE).unwrap();
-                }
-                _ => unreachable!(),
             }
         }
     }
 }
-
