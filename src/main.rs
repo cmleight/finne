@@ -56,20 +56,15 @@ fn main() {
                                     socket,
                                     buf: buf.into(),
                                 });
-                                println!("Token: {:?}", key);
-                                println!("Setting up initial socket: {:?}", sockets.len());
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
                         }
-                        println!("Done setting up initial socket: {:?}", sockets.len());
                     },
                     token if event.is_readable() => {
-                        println!("Reading socket: {:?}", sockets.len());
                         receive_request(token.0 - 1, &mut sockets, &mut poll, &mut buffer)
                     },
                     token if event.is_writable() => {
-                        println!("Sockets when writing: {:?}", sockets.len());
                         let socket = sockets.get_mut(token.0 - 1).unwrap();
                         socket.socket.write_all(RESPONSE.as_bytes()).unwrap();
 
@@ -90,14 +85,12 @@ fn receive_request(token: usize, sockets: &mut Slab<Connection>, poll: &mut Poll
         value: &[],
     }; 16];
     let mut request_parser = httparse::Request::new(&mut headers);
-    println!("Sockets: {:?}", sockets.len());
     let conn = sockets.get_mut(token).unwrap();
     loop {
         let read = conn.socket.read(buffer);
         match read {
             Ok(0) => {
                 sockets.remove(token);
-                println!("Removing socket: {:?}", sockets.len());
                 break;
             }
             Ok(n) => {
