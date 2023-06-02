@@ -32,6 +32,7 @@ fn main() {
     let buf_pool = Pool::new(300, &|| BytesMut::with_capacity(1024));
 
     let mut events = Events::with_capacity(1024);
+    let mut buffer = [0_u8; 1024];
     {
         let mut sockets: Slab<Connection> = Slab::new();
         loop {
@@ -49,12 +50,13 @@ fn main() {
                                 buf.clear();
                                 let key = next.key();
                                 poll.registry()
-                                    .register(&mut socket, Token(key), Interest::READABLE)
+                                    .register(&mut socket, Token(key + 1), Interest::READABLE)
                                     .unwrap();
                                 next.insert(Connection{
                                     socket,
                                     buf: buf.into(),
                                 });
+                                println!("Token: {:?}", key);
                                 println!("Setting up initial socket: {:?}", sockets.len());
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -64,11 +66,11 @@ fn main() {
                     },
                     token if event.is_readable() => {
                         println!("Reading socket: {:?}", sockets.len());
-                        receive_request(token, &mut sockets, &mut poll)
+                        receive_request(token.0 - 1, &mut sockets, &mut poll, &mut buffer)
                     },
                     token if event.is_writable() => {
                         println!("Sockets when writing: {:?}", sockets.len());
-                        let socket = sockets.get_mut(token.0).unwrap();
+                        let socket = sockets.get_mut(token.0 - 1).unwrap();
                         socket.socket.write_all(RESPONSE.as_bytes()).unwrap();
 
                         poll.registry()
@@ -82,40 +84,35 @@ fn main() {
     }
 }
 
-fn receive_request(token: Token, sockets: &mut Slab<Connection>, poll: &mut Poll) {
+fn receive_request(token: usize, sockets: &mut Slab<Connection>, poll: &mut Poll, buffer: &mut [u8]) {
     let mut headers = [httparse::Header {
         name: "",
         value: &[],
     }; 16];
     let mut request_parser = httparse::Request::new(&mut headers);
-    let mut buffer = [0_u8; 1024];
     println!("Sockets: {:?}", sockets.len());
+    let conn = sockets.get_mut(token).unwrap();
     loop {
-        let conn = sockets.get_mut(token.0).unwrap();
-        let read = conn.socket.read(&mut buffer);
+        let read = conn.socket.read(buffer);
         match read {
             Ok(0) => {
-                sockets.remove(token.0);
+                sockets.remove(token);
                 println!("Removing socket: {:?}", sockets.len());
                 break;
             }
             Ok(n) => {
-                let req: &mut BytesMut = &mut conn.buf;
-                if req.remaining_mut() < n {
-                    req.reserve(n)
-                }
-                req.put_slice(&buffer[0..n])
+                conn.buf.put(&buffer[0..n])
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
     }
 
-    if let Some(conn) = sockets.get(token.0) {
+    if let Some(conn) = sockets.get(token) {
         if request_parser.parse(&conn.buf).unwrap().is_complete() {
-            if let Some(socket) = sockets.get_mut(token.0) {
+            if let Some(socket) = sockets.get_mut(token) {
                 poll.registry()
-                    .reregister(&mut socket.socket, token, Interest::WRITABLE)
+                    .reregister(&mut socket.socket, Token(token + 1), Interest::WRITABLE)
                     .unwrap();
             }
         }
