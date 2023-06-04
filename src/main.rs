@@ -1,4 +1,7 @@
+use std::future::pending;
 use std::io::{Read, Write};
+use std::ops::DerefMut;
+use std::time::{Duration, Instant};
 
 use slab::Slab;
 use bytes::{BufMut, BytesMut};
@@ -7,17 +10,32 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
 
-static RESPONSE: &str = "HTTP/1.1 200 OK
-Content-Type: text/html
-Connection: keep-alive
-Content-Length: 6
+struct RequestBuffers {
+    parse_buf: BytesMut,
+    resp_buf: BytesMut,
+}
 
-hello
-";
+impl RequestBuffers {
+    fn clear(&mut self) {
+        self.parse_buf.clear();
+        self.resp_buf.clear();
+    }
+}
 
 struct Connection<'a> {
     socket: TcpStream,
-    buf: Reusable<'a, BytesMut>,
+    buffers: Reusable<'a, RequestBuffers>,
+}
+
+#[inline]
+fn pull_or_create(pool: &Pool<RequestBuffers>) -> Reusable<RequestBuffers> {
+    return pool.pull(|| {
+        println!("Miss object pool allocation!");
+        return RequestBuffers{
+            parse_buf: BytesMut::with_capacity(1024),
+            resp_buf: BytesMut::with_capacity(1024),
+        };
+    });
 }
 
 fn main() {
@@ -29,32 +47,37 @@ fn main() {
         .register(&mut listener, Token(0), Interest::READABLE)
         .unwrap();
 
-    let buf_pool = Pool::new(300, &|| BytesMut::with_capacity(1024));
+    let buf_pool = Pool::new(300, &|| RequestBuffers{
+        parse_buf: BytesMut::with_capacity(1024),
+        resp_buf: BytesMut::with_capacity(1024),
+    });
 
+    let mut pending_requests: Vec<usize> = Vec::new();
     let mut events = Events::with_capacity(1024);
     let mut buffer = [0_u8; 1024];
     {
         let mut sockets: Slab<Connection> = Slab::new();
         loop {
-            poll.poll(&mut events, None).unwrap();
+            let poll_duration = if pending_requests.len() == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(0))
+            };
+            poll.poll(&mut events, poll_duration).unwrap();
+
+            // Get requests
             for event in &events {
                 match event.token() {
                     Token(0) => loop {
                         match listener.accept() {
                             Ok((mut socket, _)) => {
                                 let next = sockets.vacant_entry();
-                                let mut buf = buf_pool.pull(|| {
-                                    println!("Miss object pool allocation!");
-                                    return BytesMut::with_capacity(1024);
-                                });
-                                buf.clear();
-                                let key = next.key();
                                 poll.registry()
-                                    .register(&mut socket, Token(key + 1), Interest::READABLE)
+                                    .register(&mut socket, Token(next.key() + 1), Interest::READABLE)
                                     .unwrap();
                                 next.insert(Connection{
                                     socket,
-                                    buf: buf.into(),
+                                    buffers: pull_or_create(&buf_pool),
                                 });
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -62,11 +85,14 @@ fn main() {
                         }
                     },
                     token if event.is_readable() => {
-                        receive_request(token.0 - 1, &mut sockets, &mut poll, &mut buffer)
+                        let request_number = token.0 - 1;
+                        receive_request(request_number, &mut sockets, &mut poll, &mut buffer);
+                        // pending_requests.push(request_number);
                     },
                     token if event.is_writable() => {
                         let socket = sockets.get_mut(token.0 - 1).unwrap();
-                        socket.socket.write_all(RESPONSE.as_bytes()).unwrap();
+                        let resp = &socket.buffers.resp_buf;
+                        socket.socket.write_all(resp).unwrap();
 
                         poll.registry()
                             .reregister(&mut socket.socket, token, Interest::READABLE)
@@ -75,6 +101,13 @@ fn main() {
                     _ => unreachable!(),
                 }
             }
+
+            // // Process requests
+            // let now = Instant::now();
+            // while now - Instant::now() < Duration::from_millis(100) && pending_requests.len() > 0 {
+            //     let curr_req = pending_requests.pop();
+            //     println!("Processing {:?}", curr_req);
+            // }
         }
     }
 }
@@ -86,6 +119,7 @@ fn receive_request(token: usize, sockets: &mut Slab<Connection>, poll: &mut Poll
     }; 16];
     let mut request_parser = httparse::Request::new(&mut headers);
     let conn = sockets.get_mut(token).unwrap();
+    conn.buffers.clear();
     loop {
         let read = conn.socket.read(buffer);
         match read {
@@ -93,21 +127,70 @@ fn receive_request(token: usize, sockets: &mut Slab<Connection>, poll: &mut Poll
                 sockets.remove(token);
                 break;
             }
-            Ok(n) => {
-                conn.buf.put(&buffer[0..n])
-            }
+            Ok(n) => conn.buffers.parse_buf.put(&buffer[0..n]),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
         }
     }
 
-    if let Some(conn) = sockets.get(token) {
-        if request_parser.parse(&conn.buf).unwrap().is_complete() {
-            if let Some(socket) = sockets.get_mut(token) {
-                poll.registry()
-                    .reregister(&mut socket.socket, Token(token + 1), Interest::WRITABLE)
-                    .unwrap();
-            }
+    if let Some(conn) = sockets.get_mut(token) {
+        let buffers = conn.buffers.deref_mut();
+        if request_parser.parse(&mut buffers.parse_buf).unwrap().is_complete() {
+            process_request(request_parser, &mut buffers.resp_buf);
+            poll.registry()
+                .reregister(&mut conn.socket, Token(token + 1), Interest::WRITABLE)
+                .unwrap();
         }
     }
+}
+
+fn process_request(request: httparse::Request, resp_buf: &mut BytesMut) {
+    let (status_code, body): (&str, &str) = match (request.path, request.method) {
+        (Some("/"), Some("GET")) => {
+            ("200 OK", "index\n")
+        },
+        (Some("/u"), Some("POST")) |
+        (Some("/update"), Some("POST")) |
+        (Some("/u"), Some("PUT")) |
+        (Some("/update"), Some("PUT")) => {
+            ("200 OK", "\n")
+        },
+        (Some("/d"), Some("DELETE")) |
+        (Some("/delete"), Some("DELETE")) => {
+            ("200 OK", "\n")
+        },
+        (Some("/s"), Some("GET")) |
+        (Some("/search"), Some("GET")) |
+        (Some("/q"), Some("GET")) |
+        (Some("/query"), Some("GET")) => {
+            ("200 OK", "search\n")
+        },
+        _ => ("404 Not Found", "\n"),
+    };
+
+    create_html_response(resp_buf, status_code.as_bytes(), body.as_bytes());
+}
+
+static CONNECTION_CONTENT: &[u8] = b"\nContent-Type: text/html\nConnection: keep-alive\nContent-Length: ";
+static HTML_VERSION: &[u8] = b"HTTP/1.1 \n";
+
+fn create_html_response(resp_buf: &mut BytesMut, status_code: &[u8], body: &[u8]) {
+    resp_buf.put_slice(HTML_VERSION);
+    resp_buf.put_slice(status_code);
+    resp_buf.put_slice(CONNECTION_CONTENT);
+    resp_buf.put_slice(body.len().to_string().as_bytes());
+    resp_buf.put_slice(b"\r\n\r\n");
+    resp_buf.put_slice(body);
+}
+
+fn update() {
+
+}
+
+fn query() {
+
+}
+
+fn delete() {
+
 }
