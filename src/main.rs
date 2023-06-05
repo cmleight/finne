@@ -24,9 +24,20 @@ struct RequestBuffers {
 }
 
 impl RequestBuffers {
+    #[inline(always)]
     fn clear(&mut self) {
         self.parse_buf.clear();
         self.resp_buf.clear();
+    }
+}
+
+impl Default for RequestBuffers {
+    #[inline(always)]
+    fn default() -> Self {
+        return RequestBuffers {
+            parse_buf: BytesMut::with_capacity(1024),
+            resp_buf: BytesMut::with_capacity(1024),
+        }
     }
 }
 
@@ -35,14 +46,11 @@ struct ConnectionData<'a> {
     buffers: Reusable<'a, RequestBuffers>,
 }
 
-#[inline]
+#[inline(always)]
 fn pull_or_create(pool: &Pool<RequestBuffers>) -> Reusable<RequestBuffers> {
     return pool.pull(|| {
         println!("Miss object pool allocation!");
-        return RequestBuffers {
-            parse_buf: BytesMut::with_capacity(1024),
-            resp_buf: BytesMut::with_capacity(1024),
-        };
+        return RequestBuffers::default();
     });
 }
 
@@ -57,10 +65,7 @@ fn main() {
         .register(&mut listener, Token(0), Interest::READABLE)
         .unwrap();
 
-    let buf_pool = Pool::new(300, &|| RequestBuffers {
-        parse_buf: BytesMut::with_capacity(1024),
-        resp_buf: BytesMut::with_capacity(1024),
-    });
+    let buf_pool = Pool::new(300, &|| RequestBuffers::default());
 
     let mut pending_requests: Vec<usize> = Vec::new();
     let mut events = Events::with_capacity(1024);
@@ -200,6 +205,7 @@ static CONNECTION_CONTENT: &[u8] =
     b"\nContent-Type: text/html\nConnection: keep-alive\nContent-Length: ";
 static HTML_VERSION: &[u8] = b"HTTP/1.1 \n";
 
+#[inline]
 fn create_html_response(resp_buf: &mut BytesMut, status_code: &[u8], body: &[u8]) {
     resp_buf.put_slice(HTML_VERSION);
     resp_buf.put_slice(status_code);
@@ -220,14 +226,17 @@ enum Error {
     Data,
 }
 
+#[inline]
 fn update() -> Result<bool, Error> {
     return Ok(true);
 }
 
+#[inline]
 fn query() -> Result<bool, Error> {
     return Ok(true);
 }
 
+#[inline]
 fn delete() -> Result<bool, Error> {
     return Ok(true);
 }
