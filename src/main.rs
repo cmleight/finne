@@ -1,6 +1,6 @@
 use std::future::pending;
 use std::io::{Read, Write};
-use std::ops::DerefMut;
+use std::ops::{DerefMut, Index};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
@@ -98,7 +98,7 @@ fn main() {
                                     socket,
                                     buffers: pull_or_create(&buf_pool),
                                 });
-                            }
+                            },
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
                         }
@@ -106,7 +106,7 @@ fn main() {
                     token if event.is_readable() => {
                         let request_number = token.0 - 1;
                         receive_request(request_number, &mut sockets, &mut poll, &mut buffer);
-                        pending_requests.push(request_number);
+                        // pending_requests.push(request_number);
                     }
                     token if event.is_writable() => {
                         let socket = sockets.get_mut(token.0 - 1).unwrap();
@@ -121,12 +121,12 @@ fn main() {
                 }
             }
 
-            // Process requests
-            let now = Instant::now();
-            while now - Instant::now() < Duration::from_millis(100) && pending_requests.len() > 0 {
-                let curr_req = pending_requests.pop();
-                println!("Processing {:?}", curr_req);
-            }
+            // // Process requests
+            // let now = Instant::now();
+            // while now - Instant::now() < Duration::from_millis(100) && pending_requests.len() > 0 {
+            //     let curr_req = pending_requests.pop();
+            //     println!("Processing {:?}", curr_req);
+            // }
         }
     }
 }
@@ -173,43 +173,42 @@ fn receive_request(
 }
 
 fn process_request(request: httparse::Request, resp_buf: &mut BytesMut) {
-    let (status_code, body): (&[u8], &str) = match (request.path, request.method) {
-        (Some("/"), Some("GET")) => (OK, "index\n"),
-        (Some("/u"), Some("POST"))
-        | (Some("/u"), Some("PUT"))
-        | (Some("/update"), Some("POST"))
-        | (Some("/update"), Some("PUT")) => match update() {
+    // println!("Body: {:?}", request);
+    let url = request.path.unwrap_or("404");
+    let path = url.find("?").unwrap_or(url.len());
+    let (status_code, body): (&[u8], &str) = match (&url[..path], request.method) {
+        ("/", Some("GET")) => (OK, "index\n"),
+        ("/u", Some("POST"))
+        | ("/u", Some("PUT"))
+        | ("/update", Some("POST"))
+        | ("/update", Some("PUT")) => match update() {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
-        (Some("/d"), Some("DELETE")) | (Some("/delete"), Some("DELETE")) => match update() {
+        ("/d", Some("DELETE")) | ("/delete", Some("DELETE")) => match delete() {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
-        (Some("/s"), Some("GET"))
-        | (Some("/search"), Some("GET"))
-        | (Some("/q"), Some("GET"))
-        | (Some("/query"), Some("GET")) => match update() {
+        ("/s", Some("GET"))
+        | ("/search", Some("GET")) => match search() {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
-        _ => (b"404 Not Found", "\n"),
+        _ => (MISSING, "404\n"),
     };
 
     create_html_response(resp_buf, status_code, body.as_bytes());
 }
 
-static OK: &[u8] = b"200 OK";
-static SERVER_ERROR: &[u8] = b"500 Internal Server Error";
-static CONNECTION_CONTENT: &[u8] =
-    b"\nContent-Type: text/html\nConnection: keep-alive\nContent-Length: ";
-static HTML_VERSION: &[u8] = b"HTTP/1.1 \n";
+static OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
+static SERVER_ERROR: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
+static MISSING: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
+
+// fn parse_params() ->
 
 #[inline]
 fn create_html_response(resp_buf: &mut BytesMut, status_code: &[u8], body: &[u8]) {
-    resp_buf.put_slice(HTML_VERSION);
     resp_buf.put_slice(status_code);
-    resp_buf.put_slice(CONNECTION_CONTENT);
     resp_buf.put_slice(body.len().to_string().as_bytes());
     resp_buf.put_slice(b"\r\n\r\n");
     resp_buf.put_slice(body);
@@ -232,7 +231,7 @@ fn update() -> Result<bool, Error> {
 }
 
 #[inline]
-fn query() -> Result<bool, Error> {
+fn search() -> Result<bool, Error> {
     return Ok(true);
 }
 
