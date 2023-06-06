@@ -1,7 +1,7 @@
-use std::future::pending;
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::ops::{DerefMut, Index};
-use std::time::{Duration, Instant};
+use std::ops::DerefMut;
+use std::time::{Duration};
 
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
@@ -11,43 +11,46 @@ use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
 use slab::Slab;
 
-use rusqlite::Connection;
+// use rusqlite::Connection;
 
 #[derive(Parser)]
 struct Cli {
     path: std::path::PathBuf,
 }
 
-struct RequestBuffers {
+struct RequestBuffers<'a> {
     parse_buf: BytesMut,
     resp_buf: BytesMut,
+    params: HashMap<&'a str, &'a str>,
 }
 
-impl RequestBuffers {
+impl RequestBuffers<'_> {
     #[inline(always)]
     fn clear(&mut self) {
         self.parse_buf.clear();
         self.resp_buf.clear();
+        self.params.clear();
     }
 }
 
-impl Default for RequestBuffers {
+impl Default for RequestBuffers<'_> {
     #[inline(always)]
     fn default() -> Self {
         return RequestBuffers {
-            parse_buf: BytesMut::with_capacity(1024),
-            resp_buf: BytesMut::with_capacity(1024),
+            parse_buf: BytesMut::new(),
+            resp_buf: BytesMut::new(),
+            params: HashMap::new(),
         }
     }
 }
 
 struct ConnectionData<'a> {
     socket: TcpStream,
-    buffers: Reusable<'a, RequestBuffers>,
+    buffers: Reusable<'a, RequestBuffers<'a>>,
 }
 
 #[inline(always)]
-fn pull_or_create(pool: &Pool<RequestBuffers>) -> Reusable<RequestBuffers> {
+fn pull_or_create<'a>(pool: &'a Pool<RequestBuffers<'a>>) -> Reusable<'a, RequestBuffers<'a>> {
     return pool.pull(|| {
         println!("Miss object pool allocation!");
         return RequestBuffers::default();
@@ -55,8 +58,8 @@ fn pull_or_create(pool: &Pool<RequestBuffers>) -> Reusable<RequestBuffers> {
 }
 
 fn main() {
-    let args = Cli::parse();
-    let db_conn = Connection::open(args.path);
+    // let args = Cli::parse();
+    // let db_conn = Connection::open(args.path);
     let address = "0.0.0.0:3000";
     let mut listener = TcpListener::bind(address.parse().unwrap()).unwrap();
 
@@ -67,18 +70,12 @@ fn main() {
 
     let buf_pool = Pool::new(300, &|| RequestBuffers::default());
 
-    let mut pending_requests: Vec<usize> = Vec::new();
     let mut events = Events::with_capacity(1024);
     let mut buffer = [0_u8; 1024];
     {
         let mut sockets: Slab<ConnectionData> = Slab::new();
         loop {
-            let poll_duration = if pending_requests.len() == 0 {
-                None
-            } else {
-                Some(Duration::from_secs(0))
-            };
-            poll.poll(&mut events, poll_duration).unwrap();
+            poll.poll(&mut events, Some(Duration::from_secs(0))).unwrap();
 
             // Get requests
             for event in &events {
@@ -120,13 +117,6 @@ fn main() {
                     _ => unreachable!(),
                 }
             }
-
-            // // Process requests
-            // let now = Instant::now();
-            // while now - Instant::now() < Duration::from_millis(100) && pending_requests.len() > 0 {
-            //     let curr_req = pending_requests.pop();
-            //     println!("Processing {:?}", curr_req);
-            // }
         }
     }
 }
@@ -137,11 +127,6 @@ fn receive_request(
     poll: &mut Poll,
     buffer: &mut [u8],
 ) {
-    let mut headers = [httparse::Header {
-        name: "",
-        value: &[],
-    }; 16];
-    let mut request_parser = httparse::Request::new(&mut headers);
     let conn = sockets.get_mut(token).unwrap();
     conn.buffers.clear();
     loop {
@@ -158,46 +143,50 @@ fn receive_request(
     }
 
     if let Some(conn) = sockets.get_mut(token) {
-        let buffers = conn.buffers.deref_mut();
-        if request_parser
-            .parse(&mut buffers.parse_buf)
-            .unwrap()
-            .is_complete()
-        {
-            process_request(request_parser, &mut buffers.resp_buf);
-            poll.registry()
-                .reregister(&mut conn.socket, Token(token + 1), Interest::WRITABLE)
-                .unwrap();
-        }
+        process_request(&mut conn.buffers.deref_mut());
+        poll.registry()
+            .reregister(&mut conn.socket, Token(token + 1), Interest::WRITABLE)
+            .unwrap();
     }
 }
 
-fn process_request(request: httparse::Request, resp_buf: &mut BytesMut) {
-    // println!("Body: {:?}", request);
-    let url = request.path.unwrap_or("404");
-    let path = url.find("?").unwrap_or(url.len());
-    let (status_code, body): (&[u8], &str) = match (&url[..path], request.method) {
-        ("/", Some("GET")) => (OK, "index\n"),
-        ("/u", Some("POST"))
-        | ("/u", Some("PUT"))
-        | ("/update", Some("POST"))
-        | ("/update", Some("PUT")) => match update() {
-            Ok(_) => (OK, "search\n"),
-            Err(_) => (SERVER_ERROR, "search\n"),
-        },
-        ("/d", Some("DELETE")) | ("/delete", Some("DELETE")) => match delete() {
-            Ok(_) => (OK, "search\n"),
-            Err(_) => (SERVER_ERROR, "search\n"),
-        },
-        ("/s", Some("GET"))
-        | ("/search", Some("GET")) => match search() {
-            Ok(_) => (OK, "search\n"),
-            Err(_) => (SERVER_ERROR, "search\n"),
-        },
-        _ => (MISSING, "404\n"),
-    };
+fn process_request(req: &mut RequestBuffers) {
+    let mut headers = [httparse::Header {
+        name: "",
+        value: &[],
+    }; 16];
+    let mut request = httparse::Request::new(&mut headers);
+    if request
+        .parse(&mut req.parse_buf)
+        .unwrap()
+        .is_complete()
+    {
+        // println!("Body: {:?}", request);
+        let url = request.path.unwrap_or("404");
+        let path = url.find("?").unwrap_or(url.len());
+        let (status_code, body): (&[u8], &str) = match (&url[..path], request.method) {
+            ("/", Some("GET")) => (OK, "index\n"),
+            ("/u", Some("POST"))
+            | ("/u", Some("PUT"))
+            | ("/update", Some("POST"))
+            | ("/update", Some("PUT")) => match update() {
+                Ok(_) => (OK, "search\n"),
+                Err(_) => (SERVER_ERROR, "search\n"),
+            },
+            ("/d", Some("DELETE")) | ("/delete", Some("DELETE")) => match delete() {
+                Ok(_) => (OK, "search\n"),
+                Err(_) => (SERVER_ERROR, "search\n"),
+            },
+            ("/s", Some("GET"))
+            | ("/search", Some("GET")) => match search() {
+                Ok(_) => (OK, "search\n"),
+                Err(_) => (SERVER_ERROR, "search\n"),
+            },
+            _ => (MISSING, "404\n"),
+        };
 
-    create_html_response(resp_buf, status_code, body.as_bytes());
+        create_html_response(&mut req.resp_buf, status_code, body.as_bytes());
+    }
 }
 
 static OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
@@ -223,6 +212,14 @@ enum Operation {
 enum Error {
     InvalidRequest,
     Data,
+}
+
+#[inline]
+fn parse_params<'a>(url_params: &'a str, params: &mut HashMap<&'a str, &'a str>) {
+    return url_params
+        .split("&")
+        .filter_map(|param| param.split_once("="))
+        .for_each(|(key, value)| _ = params.insert(key, value));
 }
 
 #[inline]
