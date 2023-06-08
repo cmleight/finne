@@ -3,15 +3,16 @@ use std::io::{Read, Write};
 use std::ops::DerefMut;
 use std::time::{Duration};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use httparse;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
+use rusqlite::Connection;
 use slab::Slab;
 
-// use rusqlite::Connection;
+const BUF_EXPANSION: usize = 1024;
 
 #[derive(Parser)]
 struct Cli {
@@ -58,8 +59,11 @@ fn pull_or_create<'a>(pool: &'a Pool<RequestBuffers<'a>>) -> Reusable<'a, Reques
 }
 
 fn main() {
-    // let args = Cli::parse();
-    // let db_conn = Connection::open(args.path);
+    let args = Cli::parse();
+    let mut db_conn = match Connection::open(args.path) {
+        Ok(conn) => conn,
+        Err(e) => panic!("Encountered error {:?}", e),
+    };
     let address = "0.0.0.0:3000";
     let mut listener = TcpListener::bind(address.parse().unwrap()).unwrap();
 
@@ -70,8 +74,8 @@ fn main() {
 
     let buf_pool = Pool::new(300, &|| RequestBuffers::default());
 
-    let mut events = Events::with_capacity(1024);
-    let mut buffer = [0_u8; 1024];
+    let mut events = Events::with_capacity(BUF_EXPANSION);
+    let mut buffer = [0_u8; BUF_EXPANSION];
     {
         let mut sockets: Slab<ConnectionData> = Slab::new();
         loop {
@@ -102,7 +106,7 @@ fn main() {
                     },
                     token if event.is_readable() => {
                         let request_number = token.0 - 1;
-                        receive_request(request_number, &mut sockets, &mut poll, &mut buffer);
+                        receive_request(request_number, &mut sockets, &mut poll, &mut buffer, &mut db_conn);
                         // pending_requests.push(request_number);
                     }
                     token if event.is_writable() => {
@@ -126,6 +130,7 @@ fn receive_request(
     sockets: &mut Slab<ConnectionData>,
     poll: &mut Poll,
     buffer: &mut [u8],
+    db_conn: &mut Connection
 ) {
     let conn = sockets.get_mut(token).unwrap();
     conn.buffers.clear();
@@ -143,42 +148,46 @@ fn receive_request(
     }
 
     if let Some(conn) = sockets.get_mut(token) {
-        process_request(&mut conn.buffers.deref_mut());
+        process_request(db_conn, conn.buffers.deref_mut());
         poll.registry()
             .reregister(&mut conn.socket, Token(token + 1), Interest::WRITABLE)
             .unwrap();
     }
 }
 
-fn process_request(req: &mut RequestBuffers) {
+fn process_request(conn: &mut Connection, req: &mut RequestBuffers<'_>) {
     let mut headers = [httparse::Header {
         name: "",
         value: &[],
     }; 16];
     let mut request = httparse::Request::new(&mut headers);
     if request
-        .parse(&mut req.parse_buf)
+        .parse(req.parse_buf.chunk())
         .unwrap()
         .is_complete()
     {
-        // println!("Body: {:?}", request);
         let url = request.path.unwrap_or("404");
         let path = url.find("?").unwrap_or(url.len());
         let (status_code, body): (&[u8], &str) = match (&url[..path], request.method) {
             ("/", Some("GET")) => (OK, "index\n"),
+            ("/c", Some("POST"))
+            | ("/create", Some("POST")) => match create(conn) {
+                Ok(_) => (OK, "create\n"),
+                Err(_) => (SERVER_ERROR, "create\n"),
+            },
             ("/u", Some("POST"))
             | ("/u", Some("PUT"))
             | ("/update", Some("POST"))
-            | ("/update", Some("PUT")) => match update() {
+            | ("/update", Some("PUT")) => match update(conn) {
                 Ok(_) => (OK, "search\n"),
                 Err(_) => (SERVER_ERROR, "search\n"),
             },
-            ("/d", Some("DELETE")) | ("/delete", Some("DELETE")) => match delete() {
+            ("/d", Some("DELETE")) | ("/delete", Some("DELETE")) => match delete(conn) {
                 Ok(_) => (OK, "search\n"),
                 Err(_) => (SERVER_ERROR, "search\n"),
             },
             ("/s", Some("GET"))
-            | ("/search", Some("GET")) => match search() {
+            | ("/search", Some("GET")) => match search(conn) {
                 Ok(_) => (OK, "search\n"),
                 Err(_) => (SERVER_ERROR, "search\n"),
             },
@@ -192,6 +201,7 @@ fn process_request(req: &mut RequestBuffers) {
 static OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
 static SERVER_ERROR: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
 static MISSING: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
+static BODY_DELIM: &[u8] = b"\r\n\r\n";
 
 // fn parse_params() ->
 
@@ -199,7 +209,7 @@ static MISSING: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nC
 fn create_html_response(resp_buf: &mut BytesMut, status_code: &[u8], body: &[u8]) {
     resp_buf.put_slice(status_code);
     resp_buf.put_slice(body.len().to_string().as_bytes());
-    resp_buf.put_slice(b"\r\n\r\n");
+    resp_buf.put_slice(BODY_DELIM);
     resp_buf.put_slice(body);
 }
 
@@ -223,16 +233,21 @@ fn parse_params<'a>(url_params: &'a str, params: &mut HashMap<&'a str, &'a str>)
 }
 
 #[inline]
-fn update() -> Result<bool, Error> {
+fn create(_conn: &mut Connection) -> Result<bool, Error> {
     return Ok(true);
 }
 
 #[inline]
-fn search() -> Result<bool, Error> {
+fn update(_conn: &mut Connection) -> Result<bool, Error> {
     return Ok(true);
 }
 
 #[inline]
-fn delete() -> Result<bool, Error> {
+fn search(_conn: &mut Connection) -> Result<bool, Error> {
+    return Ok(true);
+}
+
+#[inline]
+fn delete(_conn: &mut Connection) -> Result<bool, Error> {
     return Ok(true);
 }
