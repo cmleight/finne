@@ -211,15 +211,15 @@ fn create_html_response(resp_buf: &mut BytesMut, status_code: &[u8], body: &[u8]
     resp_buf.put_slice(body);
 }
 
-enum Operation {
+enum _Operation {
     Update,
     Delete,
     Query,
 }
 
 enum Error {
-    InvalidRequest,
-    Data,
+    _InvalidRequest,
+    _Data,
 }
 
 #[inline]
