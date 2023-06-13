@@ -1,14 +1,12 @@
 extern crate nom;
-
+use std::collections::HashMap;
 use nom::{
     branch::alt,
-    bytes::complete::{tag_no_case},
+    bytes::complete::{tag_no_case, take_until, take_while},
     character::complete::multispace0,
+    character::is_space,
     combinator::map,
     IResult,
-    error::VerboseError,
-    InputTakeAtPosition,
-    AsChar
 };
 
 // METHOD PATH PROTOCOL
@@ -18,8 +16,11 @@ use nom::{
 // \r\n\r\n
 // BODY
 
-struct HttpRequest {
+struct HttpRequest<'a> {
     method: Method,
+    path: String,
+    params: HashMap<&'a str, &'a Vec<&'a str>>,
+    protocol: Protocol,
 }
 
 #[derive(PartialEq)]
@@ -35,10 +36,12 @@ enum Method {
     Trace,
 }
 
+#[inline]
 fn consume_spaces(input: &[u8]) -> IResult<&[u8], &[u8]> {
     return multispace0(input);
 }
 
+#[inline]
 fn get_method(input: &[u8]) -> IResult<&[u8], Method> {
     return alt((
         map(tag_no_case(b"connect"), |_| Method::Connect),
@@ -53,14 +56,46 @@ fn get_method(input: &[u8]) -> IResult<&[u8], Method> {
     ))(input);
 }
 
-fn get_path(input: &[u8]) -> IResult<&[u8], &[u8]> {
-
+#[inline]
+fn get_string(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    return take_while(|i| !is_space(i))(input);
 }
+
+#[inline]
+fn is_space_or_question(input: u8) -> bool {
+    return is_space(input) || input == b'?';
+}
+
+#[inline]
+fn get_path(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    return take_while(|i| !is_space_or_question(i))(input);
+}
+
+// fn get_params(input: &[u8]) -> IResult<&[u8], HashMap<&[u8], &[u8]>> {
+//     return take_until()
+// }
+
+#[derive(PartialEq)]
+enum Protocol {
+    Http10,
+    Http11,
+}
+
+fn parse_protocol(input: &[u8]) -> IResult<&[u8], Protocol> {
+    return alt((
+        map(tag_no_case(b"http/1.0"), |_| Protocol::Http10),
+        map(tag_no_case(b"http/1.1"), |_| Protocol::Http11),
+    ))(input);
+}
+
+// fn parse_headers<'a>(input: &[u8], headers: HashMap<&[u8], &[u8]>) -> IResult<&'a [u8], HashMap<&'a [u8], &'a [u8]>> {
+//     take_until()
+// }
 
 // fn parse_request<'a>(req: Bytes) -> IResult<&'a Bytes, HttpRequest> {}
 
+#[cfg(test)]
 mod test {
-    use bytes::Bytes;
     use super::*;
 
     #[test]
@@ -68,3 +103,4 @@ mod test {
         assert!(get_method(b"PUT") == Ok((b"", Method::Put)));
     }
 }
+
