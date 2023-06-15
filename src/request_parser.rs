@@ -69,6 +69,11 @@ fn get_string_non_semicolon(input: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 #[inline]
+fn get_string_non_comma(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    return take_while(|i| !is_space(i) && i != b',')(input);
+}
+
+#[inline]
 fn is_space_or_question(input: u8) -> bool {
     return is_space(input) || input == b'?';
 }
@@ -115,11 +120,19 @@ fn parse_headers(input: &[u8]) -> IResult<&[u8], Vec<(&[u8], Vec<&[u8]>)>> {
             alt((tag("\r\n"), tag("\n"))),
             separated_pair(
                 get_string_non_semicolon,
-                |i| (tag(":"), multispace0).parse(i),
-                separated_list1(|i| (tag(","), multispace0).parse(i), get_string),
+                tag(":"),
+                parse_header_value,
             ),
         ),
         tag("\r\n\r\n"),
+    )(input);
+}
+
+#[inline]
+fn parse_header_value(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
+    return separated_list1(
+        tag(","),
+        preceded(multispace0, get_string_non_comma)
     )(input);
 }
 
@@ -187,6 +200,13 @@ mod test {
             ],
         ));
         assert_eq!(parse_headers(input), expected);
+    }
+
+    #[test]
+    fn test_parse_header_value() {
+        let input = b" en-us, en-gb";
+        let expected: IResult<&[u8], Vec<&[u8]>> = Ok((b"", vec![b"en-us", b"en-gb"]));
+        assert_eq!(parse_header_value(input), expected)
     }
 
     #[test]
