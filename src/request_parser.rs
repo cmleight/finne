@@ -9,6 +9,7 @@ use nom::{
     combinator::map,
     IResult,
 };
+use std::collections::HashSet;
 
 // METHOD PATH PROTOCOL
 // GENERAL-HEADER - (Connection, Date)
@@ -70,7 +71,10 @@ fn get_string_non_semicolon(input: &[u8]) -> IResult<&[u8], &[u8]> {
 
 #[inline]
 fn get_string_non_comma(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    return take_while(|i| !is_space(i) && i != b',')(input);
+    return take_while(|i| match i {
+        b',' | b'\r' | b'\n' => false,
+        _ => true,
+    })(input);
 }
 
 #[inline]
@@ -115,36 +119,30 @@ fn parse_protocol(input: &[u8]) -> IResult<&[u8], Protocol> {
 // TODO: Special case for Set-Cookie since it is permitted to have newlines
 #[inline]
 fn parse_headers(input: &[u8]) -> IResult<&[u8], Vec<(&[u8], Vec<&[u8]>)>> {
-    return terminated(
-        separated_list1(
-            alt((tag("\r\n"), tag("\n"))),
-            separated_pair(
-                get_string_non_semicolon,
-                tag(":"),
-                parse_header_value,
-            ),
+    return separated_list1(
+        alt((tag("\r\n"), tag("\n"))),
+        preceded(
+            multispace0,
+            separated_pair(get_string_non_semicolon, tag(":"), parse_header_value),
         ),
-        tag("\r\n\r\n"),
     )(input);
 }
 
 #[inline]
 fn parse_header_value(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
-    return separated_list1(
-        tag(","),
-        preceded(multispace0, get_string_non_comma)
-    )(input);
+    return separated_list1(tag(","), preceded(multispace0, get_string_non_comma))(input);
 }
 
 #[inline]
 fn parse_request(req: &[u8]) -> HttpRequest {
-    let (body, (method, path, mut params, _, protocol, headers)) = (
+    let (body, (method, path, mut params, _, protocol, headers, _)) = (
         parse_method,
         parse_path,
         parse_params,
         multispace1,
         parse_protocol,
         parse_headers,
+        preceded(tag("\r\n\r\n"), multispace0),
     )
         .parse(req)
         .unwrap();
@@ -191,7 +189,7 @@ mod test {
 
     #[test]
     fn test_parse_headers() {
-        let input = b"Content-Length: length\r\nAccept-Language: en-us, en-gb\r\n";
+        let input = b"Content-Length: length\r\nAccept-Language: en-us, en-gb";
         let expected: IResult<&[u8], Vec<(&[u8], Vec<&[u8]>)>> = Ok((
             b"",
             vec![
@@ -212,7 +210,7 @@ mod test {
     #[test]
     fn test_parse_request() {
         let example_text: Vec<&[u8]> = vec![
-            b"POST /cgi-bin/process.cgi HTTP/1.1\r\n",
+            b"POST /cgi-bin/process.cgi?test=1&two=2 HTTP/1.1\r\n",
             b"User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n",
             b"Host: www.tutorialspoint.com\r\n",
             b"Content-Type: application/x-www-form-urlencoded\r\n",
@@ -228,15 +226,28 @@ mod test {
             test_arr.put_slice(arr);
         }
         let res = parse_request(&test_arr);
+        let expected_params: Option<Vec<(&[u8], &[u8])>> =
+            Some(vec![(b"test", b"1"), (b"two", b"2")]);
         assert_eq!(
             res,
             HttpRequest {
-                method: Method::Connect,
-                path: &[],
-                params: None,
-                protocol: Protocol::Http10,
-                headers: vec![],
-                body: &[],
+                method: Method::Post,
+                path: b"/cgi-bin/process.cgi",
+                params: expected_params,
+                protocol: Protocol::Http11,
+                headers: vec![
+                    (
+                        b"User-Agent",
+                        vec![b"Mozilla/4.0 (compatible; MSIE5.01; Windows NT)"]
+                    ),
+                    (b"Host", vec![b"www.tutorialspoint.com"]),
+                    (b"Content-Type", vec![b"application/x-www-form-urlencoded"]),
+                    (b"Content-Length", vec![b"length"]),
+                    (b"Accept-Language", vec![b"en-us"]),
+                    (b"Accept-Encoding", vec![b"gzip", b"deflate"]),
+                    (b"Connection", vec![b"Keep-Alive"]),
+                ],
+                body: b"licenseID=string&content=string&/paramsXML=string",
             }
         );
     }
