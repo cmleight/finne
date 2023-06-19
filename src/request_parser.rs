@@ -4,12 +4,11 @@ use nom::sequence::{preceded, separated_pair, terminated, Tuple};
 use nom::{
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_while},
-    character::complete::{alphanumeric1, multispace0, multispace1},
+    character::complete::{alphanumeric1, multispace0},
     character::is_space,
     combinator::map,
     IResult,
 };
-use std::collections::HashSet;
 
 // METHOD PATH PROTOCOL
 // GENERAL-HEADER - (Connection, Date)
@@ -19,17 +18,17 @@ use std::collections::HashSet;
 // BODY
 
 #[derive(PartialEq, Debug)]
-struct HttpRequest<'a> {
-    method: Method,
-    path: &'a [u8],
-    params: Option<Vec<(&'a [u8], &'a [u8])>>,
-    protocol: Protocol,
-    headers: Vec<(&'a [u8], Vec<&'a [u8]>)>,
-    body: &'a [u8],
+pub struct HttpRequest<'a> {
+    pub method: Method,
+    pub path: &'a [u8],
+    pub params: Option<Vec<(&'a [u8], &'a [u8])>>,
+    pub protocol: Protocol,
+    pub headers: Vec<(&'a [u8], Vec<&'a [u8]>)>,
+    pub body: &'a [u8],
 }
 
 #[derive(PartialEq, Debug)]
-enum Method {
+pub enum Method {
     Connect,
     Delete,
     Get,
@@ -60,8 +59,8 @@ fn parse_method(input: &[u8]) -> IResult<&[u8], Method> {
 }
 
 #[inline]
-fn get_string(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    return take_while(|i| !is_space(i))(input);
+fn get_string_param(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    return take_while(|i| !is_space(i) && i != b'&')(input);
 }
 
 #[inline]
@@ -96,14 +95,14 @@ fn parse_params(input: &[u8]) -> IResult<&[u8], Vec<Vec<(&[u8], &[u8])>>> {
             tag("?"),
             separated_list0(
                 tag("&"),
-                separated_pair(alphanumeric1, tag("="), alphanumeric1),
+                separated_pair(alphanumeric1, tag("="), get_string_param),
             ),
         ),
     )(input);
 }
 
 #[derive(PartialEq, Debug)]
-enum Protocol {
+pub enum Protocol {
     Http10,
     Http11,
 }
@@ -134,25 +133,27 @@ fn parse_header_value(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
 }
 
 #[inline]
-fn parse_request(req: &[u8]) -> HttpRequest {
-    let (body, (method, path, mut params, _, protocol, headers, _)) = (
+pub(crate) fn parse_request(req: &[u8]) -> Result<HttpRequest, nom::Err<nom::error::Error<&[u8]>>> {
+    return match (
         parse_method,
         parse_path,
         parse_params,
-        multispace1,
+        multispace0,
         parse_protocol,
         parse_headers,
         preceded(tag("\r\n\r\n"), multispace0),
     )
         .parse(req)
-        .unwrap();
-    return HttpRequest {
-        method,
-        path,
-        params: params.pop(),
-        protocol,
-        headers,
-        body,
+    {
+        Ok((body, (method, path, mut params, _, protocol, headers, _))) => Ok(HttpRequest {
+            method,
+            path,
+            params: params.pop(),
+            protocol,
+            headers,
+            body,
+        }),
+        Err(a) => Err(a),
     };
 }
 
@@ -230,7 +231,7 @@ mod test {
             Some(vec![(b"test", b"1"), (b"two", b"2")]);
         assert_eq!(
             res,
-            HttpRequest {
+            Ok(HttpRequest {
                 method: Method::Post,
                 path: b"/cgi-bin/process.cgi",
                 params: expected_params,
@@ -248,7 +249,62 @@ mod test {
                     (b"Connection", vec![b"Keep-Alive"]),
                 ],
                 body: b"licenseID=string&content=string&/paramsXML=string",
-            }
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_firefox_request() {
+        let example_text: Vec<&[u8]> = vec![
+            b"GET /s?q=su:dog HTTP/1.1\r\n",
+            b"Host: localhost:3000\r\n",
+            b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0\r\n",
+            b"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n",
+            b"Accept-Language: en-US,en;q=0.5\r\n",
+            b"Accept-Encoding: gzip, deflate, br\r\n",
+            b"Connection: keep-alive\r\n",
+            b"Cookie: Clion-bcf0c5d2=c123866b-c839-4af5-bd38-5fa78bcfea64\r\n",
+            b"Upgrade-Insecure-Requests: 1\r\n",
+            b"Sec-Fetch-Dest: document\r\n",
+            b"Sec-Fetch-Mode: navigate\r\n",
+            b"Sec-Fetch-Site: none\r\n",
+            b"Sec-Fetch-User: ?1\r\n\r\n",
+        ];
+        let mut test_arr = BytesMut::new();
+        for arr in example_text {
+            test_arr.put_slice(arr);
+        }
+        let res = parse_request(&test_arr);
+        let params: Option<Vec<(&[u8], &[u8])>> = Some(vec![(b"q", b"su:dog")]);
+        assert_eq!(
+            res,
+            Ok(HttpRequest {
+                method: Method::Get,
+                path: b"/s",
+                params,
+                protocol: Protocol::Http11,
+                headers: vec![
+                    (b"Host", vec![b"localhost:3000"]),
+                    (
+                        b"User-Agent",
+                        vec![b"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"]
+                    ),
+                    (
+                        b"Accept",
+                        vec![b"text/html", b"application/xhtml+xml", b"application/xml;q=0.9", b"image/avif", b"image/webp", b"*/*;q=0.8"]
+                    ),
+                    (b"Accept-Language", vec![b"en-US", b"en;q=0.5"]),
+                    (b"Accept-Encoding", vec![b"gzip", b"deflate", b"br"]),
+                    (b"Connection", vec![b"keep-alive"]),
+                    (b"Cookie", vec![b"Clion-bcf0c5d2=c123866b-c839-4af5-bd38-5fa78bcfea64"]),
+                    (b"Upgrade-Insecure-Requests", vec![b"1"]),
+                    (b"Sec-Fetch-Dest", vec![b"document"]),
+                    (b"Sec-Fetch-Mode", vec![b"navigate"]),
+                    (b"Sec-Fetch-Site", vec![b"none"]),
+                    (b"Sec-Fetch-User", vec![b"?1"]),
+                ],
+                body: b"",
+            })
         );
     }
 }

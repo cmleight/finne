@@ -2,9 +2,8 @@ use std::io::{Read, Write};
 use std::ops::DerefMut;
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use clap::Parser;
-use httparse;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
@@ -12,6 +11,7 @@ use rusqlite::Connection;
 use slab::Slab;
 
 mod request_parser;
+use request_parser::Method;
 
 const BUF_EXPANSION: usize = 1024;
 
@@ -161,40 +161,39 @@ fn receive_request(
 }
 
 fn process_request(conn: &mut Connection, req: &mut RequestBuffers) {
-    let mut headers = [httparse::Header {
-        name: "",
-        value: &[],
-    }; 16];
-    let mut request = httparse::Request::new(&mut headers);
-    if request.parse(req.parse_buf.chunk()).unwrap().is_complete() {
-        let url = request.path.unwrap_or("404");
-        let path = url.find("?").unwrap_or(url.len());
-        let (status_code, body): (&[u8], &str) = match (&url[..path], request.method) {
-            ("/", Some("GET")) => (OK, "index\n"),
-            ("/c", Some("POST")) | ("/create", Some("POST")) => match create(conn) {
-                Ok(_) => (OK, "create\n"),
-                Err(_) => (SERVER_ERROR, "create\n"),
-            },
-            ("/u", Some("POST"))
-            | ("/u", Some("PUT"))
-            | ("/update", Some("POST"))
-            | ("/update", Some("PUT")) => match update(conn) {
-                Ok(_) => (OK, "search\n"),
-                Err(_) => (SERVER_ERROR, "search\n"),
-            },
-            ("/d", Some("DELETE")) | ("/delete", Some("DELETE")) => match delete(conn) {
-                Ok(_) => (OK, "search\n"),
-                Err(_) => (SERVER_ERROR, "search\n"),
-            },
-            ("/s", Some("GET")) | ("/search", Some("GET")) => match search(conn) {
-                Ok(_) => (OK, "search\n"),
-                Err(_) => (SERVER_ERROR, "search\n"),
-            },
-            _ => (MISSING, "404\n"),
-        };
+    let http_req = match request_parser::parse_request(&req.parse_buf) {
+        Ok(req) => req,
+        Err(e) => {
+            println!("Error parsing request: {:?}", e);
+            println!("Request: {:?}", req.parse_buf);
+            return;
+        }
+    };
+    let (status_code, body): (&[u8], &str) = match (http_req.path, http_req.method) {
+        (b"/", Method::Get) => (OK, "index\n"),
+        (b"/c", Method::Post) | (b"/create", Method::Post) => match create(conn) {
+            Ok(_) => (OK, "create\n"),
+            Err(_) => (SERVER_ERROR, "create\n"),
+        },
+        (b"/u", Method::Post)
+        | (b"/u", Method::Put)
+        | (b"/update", Method::Post)
+        | (b"/update", Method::Put) => match update(conn) {
+            Ok(_) => (OK, "search\n"),
+            Err(_) => (SERVER_ERROR, "search\n"),
+        },
+        (b"/d", Method::Delete) | (b"/delete", Method::Delete) => match delete(conn) {
+            Ok(_) => (OK, "search\n"),
+            Err(_) => (SERVER_ERROR, "search\n"),
+        },
+        (b"/s", Method::Get) | (b"/search", Method::Get) => match search(conn) {
+            Ok(_) => (OK, "search\n"),
+            Err(_) => (SERVER_ERROR, "search\n"),
+        },
+        _ => (MISSING, "404\n"),
+    };
 
-        create_html_response(&mut req.resp_buf, status_code, body.as_bytes());
-    }
+    create_html_response(&mut req.resp_buf, status_code, body.as_bytes());
 }
 
 static OK: &[u8] =

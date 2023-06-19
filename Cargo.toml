@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 bytes = {version = "1", features = ["serde"]}
 clap = { version = "4.3", features = ["derive"] }
-httparse = "1.8.0"
 mio = {version = "0.8", features = ["os-ext", "os-poll", "net"]}
 nom = "7.1"
 object-pool = "0.5.4"
