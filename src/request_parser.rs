@@ -21,10 +21,23 @@ use nom::{
 pub struct HttpRequest<'a> {
     pub method: Method,
     pub path: &'a [u8],
-    pub params: Option<Vec<(&'a [u8], &'a [u8])>>,
+    params: Option<Vec<(&'a [u8], &'a [u8])>>,
     pub protocol: Protocol,
     pub headers: Vec<(&'a [u8], Vec<&'a [u8]>)>,
     pub body: &'a [u8],
+}
+
+impl HttpRequest<'_> {
+    pub fn get_parameter(&self, key: &str) -> Option<&[u8]> {
+        return match self.params {
+            Some(ref params) => params
+                .iter()
+                .find(|&(k, v)| k == &key.as_bytes())
+                .map(|&(_, v)| v)
+                .take(),
+            None => None,
+        };
+    }
 }
 
 #[derive(PartialEq, Debug)]

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::ops::DerefMut;
 use std::time::Duration;
@@ -8,10 +9,15 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
 use rusqlite::Connection;
+use serde::Deserialize;
+use serde_json;
 use slab::Slab;
 
+mod query_parser;
 mod request_parser;
-use request_parser::Method;
+
+use crate::request_parser::HttpRequest;
+use crate::request_parser::Method;
 
 const BUF_EXPANSION: usize = 1024;
 
@@ -169,24 +175,21 @@ fn process_request(conn: &mut Connection, req: &mut RequestBuffers) {
             return;
         }
     };
-    let (status_code, body): (&[u8], &str) = match (http_req.path, http_req.method) {
-        (b"/", Method::Get) => (OK, "index\n"),
-        (b"/c", Method::Post) | (b"/create", Method::Post) => match create(conn) {
-            Ok(_) => (OK, "create\n"),
-            Err(_) => (SERVER_ERROR, "create\n"),
-        },
-        (b"/u", Method::Post)
-        | (b"/u", Method::Put)
-        | (b"/update", Method::Post)
-        | (b"/update", Method::Put) => match update(conn) {
+    let (status_code, body): (&[u8], &str) = match (http_req.path, http_req.method, http_req.body) {
+        (b"/", Method::Get, _) => (OK, "index\n"),
+        (b"/c" | b"/create", Method::Post, req_body) => match create(conn, req_body) {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
-        (b"/d", Method::Delete) | (b"/delete", Method::Delete) => match delete(conn) {
+        (b"/u" | b"/update", Method::Post | Method::Put, req_body) => match update(conn) {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
-        (b"/s", Method::Get) | (b"/search", Method::Get) => match search(conn) {
+        (b"/d" | b"/delete", Method::Delete, _) => match delete(conn) {
+            Ok(_) => (OK, "search\n"),
+            Err(_) => (SERVER_ERROR, "search\n"),
+        },
+        (b"/s" | b"/search", Method::Get, _) => match search(conn) {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
@@ -210,20 +213,36 @@ fn create_html_response(resp_buf: &mut BytesMut, status_code: &[u8], body: &[u8]
     resp_buf.put_slice(body);
 }
 
-enum _Operation {
-    Update,
-    Delete,
-    Query,
-}
-
 enum Error {
-    _InvalidRequest,
+    InvalidRequest,
     _Data,
 }
 
+#[derive(Deserialize)]
+enum IndexType {
+    Integer,
+    Real,
+    Text,
+}
+
+#[derive(Deserialize)]
+struct CreateRequest {
+    name: String,
+    indexes: HashMap<String, IndexType>,
+}
+
 #[inline]
-fn create(_conn: &mut Connection) -> Result<bool, Error> {
-    return Ok(true);
+fn create(conn: &mut Connection, body: &[u8]) -> Result<bool, Error> {
+    match serde_json::from_slice::<CreateRequest>(body) {
+        Ok(req) => {
+            return Ok(true);
+        }
+        Err(e) => {
+            println!("Error parsing request: {:?}", e);
+            println!("Request: {:?}", body);
+            return Err(Error::InvalidRequest);
+        }
+    };
 }
 
 #[inline]
