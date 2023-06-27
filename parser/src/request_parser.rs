@@ -146,7 +146,7 @@ fn parse_header_value(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
 }
 
 #[inline]
-pub(crate) fn parse_request(req: &[u8]) -> Result<HttpRequest, nom::Err<nom::error::Error<&[u8]>>> {
+pub fn parse_request(req: &[u8]) -> Result<HttpRequest, nom::Err<nom::error::Error<&[u8]>>> {
     return match (
         parse_method,
         parse_path,

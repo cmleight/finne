@@ -13,11 +13,8 @@ use serde::Deserialize;
 use serde_json;
 use slab::Slab;
 
-mod query_parser;
-mod request_parser;
-
-use crate::request_parser::HttpRequest;
-use crate::request_parser::Method;
+use finne_parser::request_parser::HttpRequest;
+use finne_parser::request_parser::Method;
 
 const BUF_EXPANSION: usize = 1024;
 
@@ -55,7 +52,7 @@ struct ConnectionData<'a> {
 }
 
 #[inline(always)]
-fn pull_or_create<'a>(pool: &'a Pool<RequestBuffers>) -> Reusable<'a, RequestBuffers> {
+fn pull_or_create(pool: &Pool<RequestBuffers>) -> Reusable<RequestBuffers> {
     return pool.pull(|| {
         println!("Miss object pool allocation!");
         return RequestBuffers::default();
@@ -167,7 +164,7 @@ fn receive_request(
 }
 
 fn process_request(conn: &mut Connection, req: &mut RequestBuffers) {
-    let http_req = match request_parser::parse_request(&req.parse_buf) {
+    let http_req = match finne_parser::request_parser::parse_request(&req.parse_buf) {
         Ok(req) => req,
         Err(e) => {
             println!("Error parsing request: {:?}", e);
