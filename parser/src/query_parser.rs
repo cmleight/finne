@@ -1,4 +1,6 @@
-use nom::IResult;
+#![allow(dead_code)]
+
+//use nom::IResult;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum NodeType {

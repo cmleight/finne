@@ -32,7 +32,7 @@ impl HttpRequest<'_> {
         return match self.params {
             Some(ref params) => params
                 .iter()
-                .find(|&(k, v)| k == &key.as_bytes())
+                .find(|&(k, _)| k == &key.as_bytes())
                 .map(|&(_, v)| v)
                 .take(),
             None => None,

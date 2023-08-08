@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json;
 use slab::Slab;
 
-use finne_parser::request_parser::HttpRequest;
+// use finne_parser::request_parser::HttpRequest;
 use finne_parser::request_parser::Method;
 
 const BUF_EXPANSION: usize = 1024;
@@ -178,7 +178,7 @@ fn process_request(conn: &mut Connection, req: &mut RequestBuffers) {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
-        (b"/u" | b"/update", Method::Post | Method::Put, req_body) => match update(conn) {
+        (b"/u" | b"/update", Method::Post | Method::Put, _req_body) => match update(conn) {
             Ok(_) => (OK, "search\n"),
             Err(_) => (SERVER_ERROR, "search\n"),
         },
@@ -224,14 +224,14 @@ enum IndexType {
 
 #[derive(Deserialize)]
 struct CreateRequest {
-    name: String,
-    indexes: HashMap<String, IndexType>,
+    _name: String,
+    _indexes: HashMap<String, IndexType>,
 }
 
 #[inline]
-fn create(conn: &mut Connection, body: &[u8]) -> Result<bool, Error> {
+fn create(_conn: &mut Connection, body: &[u8]) -> Result<bool, Error> {
     match serde_json::from_slice::<CreateRequest>(body) {
-        Ok(req) => {
+        Ok(_req) => {
             return Ok(true);
         }
         Err(e) => {
