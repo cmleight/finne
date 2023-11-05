@@ -24,7 +24,7 @@ pub enum TermType {
     Fuzzy,
     Proximity,
     Range,
-    Boosted
+    Boosted,
 }
 
 pub struct Term {
@@ -40,7 +40,6 @@ pub struct Term {
  * Example query:
  * al:dog and (al:cat or al:mouse) and not al:bird
  */
-
 
 // pub fn parse_query(query: &[u8], query_buffer: &mut [QueryNode]) -> Option<NodeType> {
 // }
