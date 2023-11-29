@@ -1,45 +1,23 @@
-use crate::request::{ConnectionData, CreateRequest, Request};
+use crate::request::{ConnectionData, RequestBuffers};
 use futures::task;
-use mio::net::{TcpListener, TcpStream};
+use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
 use rusqlite::Connection;
 use slab::Slab;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::io::{Read, Write};
-use std::pin::Pin;
-use std::sync::Arc;
 use std::task::Context;
 use std::time::Duration;
-use bytes::BufMut;
-use tokio::sync::{mpsc, Mutex};
-use finne_parser::request_parser::Method;
-
-static OK: &[u8] =
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
-static SERVER_ERROR: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
-static MISSING: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nContent-Length: ";
-
-pub struct Search {
-    future:Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    executor: mpsc::Sender<Arc<Search>>
-}
-
-impl Search {
-    async fn schedule(self: &Arc<Self>) {
-        self.executor.send(self.clone()).await;
-    }
-}
+use tokio::sync::mpsc;
 
 pub struct Server {
-    scratch: [u8; 1024],
     poll: Poll,
     events: Events,
     listener: TcpListener,
-    sockets: Slab<Reusable<'_, Request>>,
+    sockets: Slab<ConnectionData<'static>>,
     db_conn: Connection,
-    buf_pool: Pool<Request>,
+    buf_pool: Pool<RequestBuffers>,
     tasks: VecDeque<task::Waker>,
     tx: mpsc::Sender<()>,
     rx: mpsc::Receiver<()>,
@@ -61,24 +39,24 @@ impl Server {
         let events = Events::with_capacity(1024);
         let (tx, mut rx) = mpsc::channel(1024);
         Self {
-            scratch: [0_u8; 1024],
             poll,
             events,
             listener,
             sockets: Slab::new(),
             db_conn,
-            buf_pool: Pool::new(300, &|| Request::default()),
+            buf_pool: Pool::new(300, &|| RequestBuffers::default()),
             tasks: Default::default(),
             tx,
+
             rx,
         }
     }
 
     #[inline(always)]
-    fn pull_or_create(self) -> Reusable<'static, Request> {
+    fn pull_or_create(self) -> Reusable<'static, RequestBuffers> {
         return self.buf_pool.pull(|| {
             println!("Miss object pool allocation!");
-            return Request::default();
+            return RequestBuffers::default();
         });
     }
 
@@ -103,9 +81,7 @@ impl Server {
                                         Interest::READABLE,
                                     )
                                     .unwrap();
-                                let mut request = self.pull_or_create();
-                                request.set_socket(socket);
-                                next.insert(request);
+                                next.insert(ConnectionData::new(socket, self.pull_or_create()));
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
@@ -131,115 +107,11 @@ impl Server {
                     }
                     token if event.is_writable() => {
                         let socket = self.sockets.get_mut(token.0 - 1).unwrap();
-                        socket.write_response(token)
+                        socket.write_response(self.poll, token)
                     }
                     _ => unreachable!(),
                 }
             }
         }
     }
-
-    pub fn receive_request(
-        mut self,
-        buffers: &mut Request,
-        token: usize,
-        socket: &mut TcpStream,
-    ) -> bool {
-        buffers.clear();
-        loop {
-            let read = socket.read(&mut *self.scratch);
-            match read {
-                Ok(0) => {
-                    return true;
-                }
-                Ok(n) => buffers.parse_buf.put(self.scratch[0..n]),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-
-        self.process_request(buffers);
-        self.poll.registry()
-            .reregister(socket, Token(token + 1), Interest::WRITABLE)
-            .unwrap();
-        return false;
-    }
-    pub fn write_response(mut self, token: Token, buffers: &mut Request, mut socket: TcpStream) {
-        let resp = &buffers.resp_buf;
-        socket.write_all(resp).unwrap();
-
-        self.poll
-            .registry()
-            .reregister(&mut buffers.socket, token, Interest::READABLE)
-            .unwrap();
-    }
-
-    fn process_request(mut self, buffers: &mut Request) {
-        let http_req = match finne_parser::request_parser::parse_request(&mut buffers.parse_buf) {
-            Ok(req) => req,
-            Err(e) => {
-                println!("Error parsing request: {:?}", e);
-                println!("Request: {:?}", buffers.parse_buf);
-                return;
-            }
-        };
-        let (status_code, body): (&[u8], &str) =
-            match (http_req.path, http_req.method, http_req.body) {
-                (b"/", Method::Get, _) => (OK, "index\n"),
-                (b"/c" | b"/create", Method::Post, req_body) => match create(&mut self.db_conn, req_body) {
-                    Ok(_) => (OK, "search\n"),
-                    Err(_) => (SERVER_ERROR, "search\n"),
-                },
-                (b"/u" | b"/update", Method::Post | Method::Put, _req_body) => match update(&mut self.db_conn) {
-                    Ok(_) => (OK, "search\n"),
-                    Err(_) => (SERVER_ERROR, "search\n"),
-                },
-                (b"/d" | b"/delete", Method::Delete, _) => match delete(&mut self.db_conn) {
-                    Ok(_) => (OK, "search\n"),
-                    Err(_) => (SERVER_ERROR, "search\n"),
-                },
-                (b"/s" | b"/search", Method::Get, _) => match search(self.db_conn) {
-                    Ok(_) => (OK, "search\n"),
-                    Err(_) => (SERVER_ERROR, "search\n"),
-                },
-                _ => (MISSING, "404\n"),
-            };
-
-        self.create_html_response(status_code, body.as_bytes());
-    }
 }
-
-pub enum Error {
-    InvalidRequest,
-    _Data,
-}
-
-#[inline]
-fn create(_conn: &mut Connection, body: &[u8]) -> Result<bool, Error> {
-    match serde_json::from_slice::<CreateRequest>(body) {
-        Ok(_req) => {
-            return Ok(true);
-        }
-        Err(e) => {
-            println!("Error parsing request: {:?}", e);
-            println!("Request: {:?}", body);
-            return Err(Error::InvalidRequest);
-        }
-    };
-}
-
-#[inline]
-fn update(_conn: &mut Connection) -> Result<bool, Error> {
-    return Ok(true);
-}
-
-#[inline]
-fn search(_conn: Connection) -> Result<bool, Error> {
-    return Ok(true);
-}
-
-#[inline]
-fn delete(_conn: &mut Connection) -> Result<bool, Error> {
-    return Ok(true);
-}
-
