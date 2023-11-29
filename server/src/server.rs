@@ -1,6 +1,6 @@
-use crate::request::{ConnectionData, CreateRequest, Request};
+use crate::request::{CreateRequest, Request};
 use futures::task;
-use mio::net::{TcpListener, TcpStream};
+use mio::net::TcpListener;
 use mio::{Events, Interest, Poll, Token};
 use object_pool::{Pool, Reusable};
 use rusqlite::Connection;
@@ -14,6 +14,7 @@ use std::task::Context;
 use std::time::Duration;
 use bytes::BufMut;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 use finne_parser::request_parser::Method;
 
 static OK: &[u8] =
@@ -37,10 +38,10 @@ pub struct Server {
     poll: Poll,
     events: Events,
     listener: TcpListener,
-    sockets: Slab<Reusable<'_, Request>>,
+    sockets: Slab<Reusable<'static, Request>>,
     db_conn: Connection,
     buf_pool: Pool<Request>,
-    tasks: VecDeque<task::Waker>,
+    tasks: VecDeque<Pin<Box<JoinHandle<()>>>>,
     tx: mpsc::Sender<()>,
     rx: mpsc::Receiver<()>,
 }
@@ -115,10 +116,9 @@ impl Server {
                         let request_number = token.0 - 1;
                         let mut task = Box::pin(tokio::spawn(async move {
                             let conn = self.sockets.get_mut(request_number);
-                            if !conn.unwrap().receive_request(
+                            if !self.receive_request(
+                                conn.unwrap(),
                                 request_number,
-                                &mut self.poll,
-                                &mut self.db_conn,
                             ) {
                                 self.sockets.remove(request_number);
                             }
@@ -126,12 +126,12 @@ impl Server {
                         if task.as_mut().poll(&mut cx).is_pending() {
 
                         } else {
-                            self.tasks.push(task);
+                            self.tasks.push_back(task);
                         }
                     }
                     token if event.is_writable() => {
-                        let socket = self.sockets.get_mut(token.0 - 1).unwrap();
-                        socket.write_response(token)
+                        let conn = self.sockets.get_mut(token.0 - 1).unwrap();
+                        self.write_response(token, conn);
                     }
                     _ => unreachable!(),
                 }
@@ -143,16 +143,15 @@ impl Server {
         mut self,
         buffers: &mut Request,
         token: usize,
-        socket: &mut TcpStream,
     ) -> bool {
         buffers.clear();
         loop {
-            let read = socket.read(&mut *self.scratch);
+            let read = buffers.socket.unwrap().read(&mut self.scratch);
             match read {
                 Ok(0) => {
                     return true;
                 }
-                Ok(n) => buffers.parse_buf.put(self.scratch[0..n]),
+                Ok(n) => buffers.parse_buf.put(&self.scratch[0..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
@@ -160,17 +159,17 @@ impl Server {
 
         self.process_request(buffers);
         self.poll.registry()
-            .reregister(socket, Token(token + 1), Interest::WRITABLE)
+            .reregister(&mut buffers.socket.unwrap(), Token(token + 1), Interest::WRITABLE)
             .unwrap();
         return false;
     }
-    pub fn write_response(mut self, token: Token, buffers: &mut Request, mut socket: TcpStream) {
+    pub fn write_response(mut self, token: Token, buffers: &mut Request) {
         let resp = &buffers.resp_buf;
-        socket.write_all(resp).unwrap();
+        buffers.socket.unwrap().write_all(resp).unwrap();
 
         self.poll
             .registry()
-            .reregister(&mut buffers.socket, token, Interest::READABLE)
+            .reregister(&mut buffers.socket.unwrap(), token, Interest::READABLE)
             .unwrap();
     }
 
@@ -205,7 +204,7 @@ impl Server {
                 _ => (MISSING, "404\n"),
             };
 
-        self.create_html_response(status_code, body.as_bytes());
+        buffers.create_html_response(status_code, body.as_bytes());
     }
 }
 
