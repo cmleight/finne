@@ -19,22 +19,14 @@ pub struct CreateRequest {
 }
 
 pub struct Request {
-    pub(crate) socket: Option<TcpStream>,
+    pub(crate) socket: TcpStream,
     pub(crate) parse_buf: BytesMut,
     pub(crate) resp_buf: BytesMut,
 }
 
 impl Request {
-    pub fn default() -> Self {
-        Self {
-            socket: None,
-            parse_buf: BytesMut::with_capacity(1024),
-            resp_buf: BytesMut::with_capacity(1024),
-        }
-    }
-
     pub fn set_socket(&mut self, socket: TcpStream) {
-        self.socket = Some(socket);
+        self.socket = socket;
     }
 
     #[inline(always)]
@@ -44,7 +36,7 @@ impl Request {
     }
 
     #[inline]
-    pub(crate) fn create_html_response(mut self, status_code: &[u8], body: &[u8]) {
+    fn create_html_response(mut self, status_code: &[u8], body: &[u8]) {
         self.resp_buf.put_slice(status_code);
         self.resp_buf
             .put_slice(body.len().to_string().as_bytes());
