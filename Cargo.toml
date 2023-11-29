@@ -2,5 +2,6 @@
 
 members = [
     "parser",
-    "server",
+    "single_server",
+    "tokio_server",
 ]
